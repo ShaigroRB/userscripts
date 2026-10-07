@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Webnovel Chapter Capture → EPUB
 // @namespace    https://github.com/local/webnovel-epub
-// @version      1.0
+// @version      1.1
 // @description  Capture webnovel.com chapters as they load into the reader (including ones appended by ←/→ navigation), then export an EPUB or a ZIP.
 // @match        https://www.webnovel.com/book/*
 // @grant        GM_setValue
@@ -60,7 +60,12 @@
     return `webnovel_capture::${bookId()}`;
   }
 
-  // store = { name, seq, chapters: { [cid]: { num, seq, title, html } } }
+  // Bumped when the stored shape or meaning changes; "Migrate" upgrades from
+  // the previous version only.
+  const STORE_VERSION = 2;
+
+  // store = { version, name, seq, lastChapter?, chapters: { [cid]: { num, seq, title, html } } }
+  // `num` is parsed from the title at capture time and can be fixed by hand.
   function loadStore() {
     const raw = GM_getValue(storeKey(), null);
     if (raw) {
@@ -70,31 +75,61 @@
         /* fall through */
       }
     }
-    return { name: novelName(), seq: 0, chapters: {} };
+    return { version: STORE_VERSION, name: novelName(), seq: 0, chapters: {} };
   }
 
   function saveStore(store) {
     GM_setValue(storeKey(), JSON.stringify(store));
   }
 
-  // Chapters sorted by their "Chapter N" number, falling back to capture order.
+  function needsMigration(store) {
+    return store.version !== STORE_VERSION && Object.keys(store.chapters).length > 0;
+  }
+
+  // v1 → v2: v1 only recognised "Chapter N" titles, so re-parse the ones it
+  // left unnumbered (e.g. titles that are just "702").
+  function migrateStore(panel) {
+    const store = loadStore();
+    if (!needsMigration(store)) return;
+    let fixed = 0;
+    for (const c of Object.values(store.chapters)) {
+      if (c.num !== null) continue;
+      c.num = parseChapterNum(c.title);
+      if (c.num !== null) fixed++;
+    }
+    store.version = STORE_VERSION;
+    saveStore(store);
+    refreshPanel(panel);
+    setStatus(panel, `Migrated: numbered ${fixed} chapter(s). Run "Check chapters" next.`, "ok");
+  }
+
+  // Chapters sorted by number; unnumbered ones go last. Ties keep capture
+  // order. Each entry is the stored chapter plus its `cid`.
   function sortedChapters(store) {
-    return Object.values(store.chapters).sort((a, b) => {
-      if (a.num !== null && b.num !== null && a.num !== b.num) return a.num - b.num;
-      return a.seq - b.seq;
-    });
+    const key = (c) => (c.num !== null ? c.num : Infinity);
+    return Object.entries(store.chapters)
+      .map(([cid, c]) => ({ ...c, cid }))
+      .sort((a, b) => key(a) - key(b) || a.seq - b.seq);
   }
 
   function chapterLabel(c) {
     return c.num !== null ? String(c.num) : `#${c.seq}`;
   }
 
+  // Title used in exports: some chapters are titled just "702".
+  function displayTitle(c) {
+    return c.num !== null && /^\d+$/.test(c.title.trim()) ? `Chapter ${c.num}` : c.title;
+  }
+
   // -----------------------------------------------------------------------
   // Read a chapter block
   // -----------------------------------------------------------------------
 
+  // "Chapter 12: …", "… Episode 701", or a bare "702". Site typos ("717"
+  // for 817) get through; "Check chapters" surfaces them for a manual fix.
   function parseChapterNum(title) {
-    const m = (title || "").match(/chapter\s*(\d+)/i);
+    const t = (title || "").trim();
+    const m = t.match(/(?:chapter|episode)\s*(\d+)/i) || t.match(/^(\d+)$/);
     return m ? parseInt(m[1], 10) : null;
   }
 
@@ -159,6 +194,129 @@
   function lastChapterEl() {
     const all = document.querySelectorAll(CHAPTER_SELECTOR);
     return all.length ? all[all.length - 1] : null;
+  }
+
+  // -----------------------------------------------------------------------
+  // Check chapters: report gaps and suspicious numbers, fix them by hand
+  // -----------------------------------------------------------------------
+
+  const ISSUES_LIST_MAX = 30;
+
+  // gaps: numbers in 1…last with no chapter. flagged: chapters whose number
+  // is missing, shared with another chapter, or past the last chapter.
+  function chapterIssues(store) {
+    const chapters = sortedChapters(store);
+    const byNum = new Map();
+    for (const c of chapters) {
+      if (c.num === null) continue;
+      if (!byNum.has(c.num)) byNum.set(c.num, []);
+      byNum.get(c.num).push(c);
+    }
+    const last = store.lastChapter || Math.max(0, ...byNum.keys());
+
+    const gaps = [];
+    for (let n = 1; n <= last; n++) if (!byNum.has(n)) gaps.push(n);
+
+    const flagged = [];
+    for (const c of chapters) {
+      if (c.num === null) flagged.push({ c, reason: "no number" });
+      else if (byNum.get(c.num).length > 1) flagged.push({ c, reason: `duplicate ${c.num}` });
+      else if (store.lastChapter && c.num > store.lastChapter) flagged.push({ c, reason: `past last chapter` });
+    }
+    return { gaps, flagged };
+  }
+
+  // The numbered chapter captured just before this one. The reader is
+  // usually advanced in order, so it tells duplicates apart (both may be
+  // titled "717") and hints at the right number.
+  function prevCaptured(store, cid) {
+    const seq = store.chapters[cid].seq;
+    let prev = null;
+    for (const c of Object.values(store.chapters)) {
+      if (c.seq < seq && c.num !== null && (!prev || c.seq > prev.seq)) prev = c;
+    }
+    return prev;
+  }
+
+  function capturedAfter(store, cid) {
+    const prev = prevCaptured(store, cid);
+    return prev ? `captured after ${prev.num}` : "captured first";
+  }
+
+  function fixNumber(panel, cid) {
+    const store = loadStore();
+    const c = store.chapters[cid];
+    if (!c) return;
+    const prev = prevCaptured(store, cid);
+    const answer = prompt(
+      `Chapter number for "${c.title}" (currently ${c.num ?? "none"}, ${capturedAfter(store, cid)}).\n` +
+        `Leave empty to unset.`,
+      prev ? prev.num + 1 : ""
+    );
+    if (answer === null) return;
+    const trimmed = answer.trim();
+    if (trimmed !== "" && !/^\d+$/.test(trimmed)) {
+      setStatus(panel, `"${trimmed}" isn't a chapter number.`, "err");
+      return;
+    }
+    c.num = trimmed === "" ? null : parseInt(trimmed, 10);
+    saveStore(store);
+    refreshPanel(panel);
+    setStatus(panel, `"${c.title}" is now chapter ${c.num ?? "(none)"}.`, "ok");
+  }
+
+  // Once "Check chapters" has been pressed, the list stays up and is
+  // refreshed with the panel, so fixes and new captures show up right away.
+  let issuesShown = false;
+
+  function renderIssues(panel, store) {
+    const box = panel.querySelector(".wc-issues");
+    box.textContent = "";
+    if (!issuesShown) return;
+    const { gaps, flagged } = chapterIssues(store);
+    if (gaps.length === 0 && flagged.length === 0) {
+      box.textContent = "No issues found.";
+      return;
+    }
+    if (gaps.length) {
+      const div = document.createElement("div");
+      const shown = gaps.slice(0, ISSUES_LIST_MAX).join(", ");
+      div.textContent = `Missing (${gaps.length}): ${shown}${gaps.length > ISSUES_LIST_MAX ? ", …" : ""}`;
+      box.append(div);
+    }
+    if (flagged.length) {
+      const div = document.createElement("div");
+      div.textContent = `To check (${flagged.length}, click to fix):`;
+      box.append(div);
+      const ul = document.createElement("ul");
+      for (const { c, reason } of flagged.slice(0, ISSUES_LIST_MAX)) {
+        const li = document.createElement("li");
+        const a = document.createElement("a");
+        a.href = "#";
+        a.textContent = `"${c.title}"`;
+        a.addEventListener("click", (e) => {
+          e.preventDefault();
+          fixNumber(panel, c.cid);
+        });
+        li.append(a, ` — ${reason}, ${capturedAfter(store, c.cid)}`);
+        ul.append(li);
+      }
+      box.append(ul);
+      if (flagged.length > ISSUES_LIST_MAX) box.append("…");
+    }
+  }
+
+  function checkChapters(panel) {
+    issuesShown = true;
+    refreshPanel(panel);
+    const { gaps, flagged } = chapterIssues(loadStore());
+    setStatus(
+      panel,
+      gaps.length || flagged.length
+        ? `${gaps.length} missing, ${flagged.length} to check.`
+        : "All chapters accounted for.",
+      gaps.length || flagged.length ? "err" : "ok"
+    );
   }
 
   // -----------------------------------------------------------------------
@@ -403,7 +561,12 @@
       const metadata = {
         name: store.name,
         bookId: bookId(),
-        chapters: chapters.map((c, i) => ({ file: `chapter_${i + 1}.html`, num: c.num, title: c.title })),
+        chapters: chapters.map((c, i) => ({
+          file: `chapter_${i + 1}.html`,
+          cid: c.cid,
+          num: c.num,
+          title: displayTitle(c),
+        })),
       };
       const entries = [
         { name: "metadata.json", text: JSON.stringify(metadata, null, 2) },
@@ -561,8 +724,8 @@
 
       const chapters = captured.map((c, i) => ({
         file: `chapter_${String(i + 1).padStart(4, "0")}.xhtml`,
-        title: c.title,
-        xhtml: chapterXhtml(c.title, toXhtmlBody(c.html)),
+        title: displayTitle(c),
+        xhtml: chapterXhtml(displayTitle(c), toXhtmlBody(c.html)),
       }));
 
       // Order matters: mimetype MUST be first.
@@ -602,7 +765,10 @@
   }
 
   function refreshPanel(panel) {
-    const chapters = sortedChapters(loadStore());
+    const store = loadStore();
+    const chapters = sortedChapters(store);
+    panel.querySelector(".wc-migrate").style.display = needsMigration(store) ? "" : "none";
+    renderIssues(panel, store);
     panel.querySelector(".wc-info").textContent =
       chapters.length === 0 ? "No chapters captured." : `${chapters.length} captured (${exportRange(chapters)})`;
     const last = lastChapterEl();
@@ -662,7 +828,12 @@
       }
       .wc-buttons button:hover { background: #e8e8e8; }
       .wc-buttons .wc-clear { color: #c0392b; border-color: #e0b4ae; }
+      .wc-buttons .wc-migrate { background: #fff4d6; border-color: #e0c27a; }
       .wc-status { margin-top: 8px; min-height: 1.2em; color: #555; }
+      .wc-issues { margin-top: 4px; color: #555; max-height: 200px; overflow-y: auto; word-break: break-word; }
+      .wc-issues:empty { display: none; }
+      .wc-issues ul { margin: 2px 0; padding-left: 16px; }
+      .wc-issues a { color: #2c6fbb; }
     `;
     root.appendChild(style);
 
@@ -687,19 +858,26 @@
           <input type="text" class="wc-title-input" placeholder="(auto-detected)">
           <label>Author</label>
           <input type="text" class="wc-author-input" placeholder="Unknown">
+          <label>Last chapter (optional, for "Check chapters")</label>
+          <input type="text" class="wc-last-input" inputmode="numeric" placeholder="e.g. 840">
         </div>
         <div class="wc-buttons">
+          <button class="wc-migrate">Migrate data from previous version</button>
           <button class="wc-capture">Capture loaded chapters</button>
+          <button class="wc-check-chapters">Check chapters</button>
           <button class="wc-epub">Download EPUB</button>
           <button class="wc-zip">Download ZIP</button>
           <button class="wc-clear">Clear all</button>
         </div>
         <div class="wc-status"></div>
+        <div class="wc-issues"></div>
       </div>
     `;
     root.appendChild(panel);
 
+    panel.querySelector(".wc-migrate").addEventListener("click", () => migrateStore(panel));
     panel.querySelector(".wc-capture").addEventListener("click", () => runCapture(panel, true));
+    panel.querySelector(".wc-check-chapters").addEventListener("click", () => checkChapters(panel));
     panel.querySelector(".wc-epub").addEventListener("click", () => downloadEpub(panel));
     panel.querySelector(".wc-zip").addEventListener("click", () => downloadZip(panel));
     panel.querySelector(".wc-clear").addEventListener("click", () => clearStore(panel));
@@ -720,6 +898,17 @@
     authorInput.addEventListener("change", () =>
       GM_setValue(`webnovel_capture_author::${bookId()}`, authorInput.value)
     );
+
+    const lastInput = panel.querySelector(".wc-last-input");
+    lastInput.value = loadStore().lastChapter || "";
+    lastInput.addEventListener("change", () => {
+      const store = loadStore();
+      const n = parseInt(lastInput.value, 10);
+      store.lastChapter = n > 0 ? n : null;
+      lastInput.value = store.lastChapter || "";
+      saveStore(store);
+      refreshPanel(panel);
+    });
 
     const autoBox = panel.querySelector(".wc-auto");
     autoBox.checked = GM_getValue("webnovel_capture_auto", true);
